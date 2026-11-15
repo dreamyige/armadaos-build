@@ -32,22 +32,18 @@ jobs:
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
           df -h /
 
-      - name: Download upstream source + init git
+      - name: Clone upstream source (with submodules)
         run: |
           set -eux
-          sudo mkdir -p /work/src
-          sudo chown "$(id -u):$(id -g)" /work/src
-          curl -fsSL --retry 3 -o /tmp/src.tgz \
-            https://codeload.github.com/ArmadaOS-Freedom/armadaos-freedom/tar.gz/refs/heads/main
-          tar -xzf /tmp/src.tgz -C /work/src --strip-components=1
-          # just build 的插件解析脚本要 git rev-parse HEAD
+          sudo mkdir -p /work
+          sudo chown "$(id -u):$(id -g)" /work
+          # 插件解析脚本需要真 git 仓库和 submodule（decky/freedom-control 等），
+          # tarball 不含这些内容。
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            https://github.com/ArmadaOS-Freedom/armadaos-freedom.git /work/src
           cd /work/src
-          git init -q
-          git config user.email "ci@armada.local"
-          git config user.name "armada-ci"
-          git add -A
-          git commit -qm "ci: upstream snapshot"
           git rev-parse HEAD
+          git submodule status | head -20
 
       - name: Install just + loop devices
         run: |
