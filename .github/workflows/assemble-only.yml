@@ -79,6 +79,23 @@ jobs:
           podman images --format '{{.Repository}}:{{.Tag}}' | grep 'armada/pkg' | sort
           echo "loaded: $(podman images --format '{{.Repository}}:{{.Tag}}' | grep -c 'armada/pkg')"
 
+      - name: Patch pull policy (localhost refs are not a registry)
+        working-directory: /work/src
+        run: |
+          # just build 用 --pull=newer，会强制对 localhost/... 做 registry 探测并失败。
+          # 改成 missing：本地有就用本地，没有才拉（公开 registry 的包可拉）。
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Justfile")
+          s = p.read_text()
+          if "--pull=newer" in s:
+              p.write_text(s.replace("--pull=newer", "--pull=missing"))
+              print("patched Justfile pull policy")
+          else:
+              print("already patched")
+          PY
+          grep -n "pull=" Justfile | head
+
       - name: Build arm64 image
         working-directory: /work/src
         run: |
