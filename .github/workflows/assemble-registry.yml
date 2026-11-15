@@ -1,0 +1,114 @@
+name: Assemble from public package registry
+
+# 最短路径：不编译包、不用 artifact。
+# just build 会按 package-hash 从公开的 ghcr.io 包仓库解析每个包。
+# 若某个包在 registry 缺失，会明确报出是哪个，再单独补编。
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "release = TB322FC+TB323FU"
+        type: choice
+        options: [release, install]
+        default: release
+      root_image_gib:
+        description: "root 镜像大小"
+        type: choice
+        options: ["32", "48"]
+        default: "32"
+
+jobs:
+  assemble:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+
+      - name: Clone upstream source (with submodules)
+        run: |
+          set -eux
+          sudo mkdir -p /work
+          sudo chown "$(id -u):$(id -g)" /work
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            https://github.com/ArmadaOS-Freedom/armadaos-freedom.git /work/src
+          cd /work/src
+          git rev-parse HEAD
+          git submodule status | head -20
+
+      - name: Install just + loop devices
+        run: |
+          sudo modprobe loop max_loop=64 || true
+          sudo losetup -D || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends uuid-runtime
+          if ! command -v just >/dev/null; then
+            URL=$(curl -fsSL https://api.github.com/repos/casey/just/releases/latest \
+                  | jq -r '.assets[] | select(.name|test("aarch64-unknown-linux-musl\\.tar\\.gz$")) | .browser_download_url' | head -1)
+            curl -fsSL "$URL" -o /tmp/just.tgz
+            sudo tar -xzf /tmp/just.tgz -C /usr/local/bin just
+          fi
+          just --version
+          docker info >/dev/null && echo "docker OK"
+          podman info >/dev/null && echo "podman OK"
+
+      - name: Check package availability on registry
+        working-directory: /work/src
+        run: |
+          set +e
+          missing=0
+          for dir in packages/*/; do
+            pkg="$(basename "$dir")"
+            [ -f "$dir/build.sh" ] || continue
+            hash="$(bash packages/package-hash.sh "$pkg")"
+            if podman manifest inspect "ghcr.io/armadaos-freedom/armada/pkg/${pkg}:${hash}" >/dev/null 2>&1; then
+              echo "OK      ${pkg}:${hash}"
+            else
+              echo "MISSING ${pkg}:${hash}"
+              missing=$((missing+1))
+            fi
+          done
+          echo "missing=$missing"
+
+      - name: Patch pull policy
+        working-directory: /work/src
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Justfile")
+          s = p.read_text()
+          if "--pull=newer" in s:
+              p.write_text(s.replace("--pull=newer", "--pull=missing"))
+              print("patched")
+          PY
+
+      - name: Build arm64 image
+        working-directory: /work/src
+        run: |
+          just build localhost/armada latest
+          podman images
+
+      - name: Build EDL package (unsigned)
+        working-directory: /work/src
+        env:
+          EDL_PACKAGE_PROFILE: ${{ inputs.profile }}
+        run: |
+          just build-edl-package-local \
+            "ostree-image-signed:docker://ghcr.io/armadaos-freedom/armadaos-freedom:testing" \
+            localhost/armada latest
+
+      - name: List output
+        working-directory: /work/src
+        run: find output/edl -type f -printf '%p  %s bytes\n' | head -50
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: edl-package-unsigned
+          path: /work/src/output/edl/**
+          if-no-files-found: error
+          compression-level: 0
