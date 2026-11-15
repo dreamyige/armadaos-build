@@ -84,6 +84,20 @@ jobs:
           done
           echo "missing=$missing"
 
+      - name: Disable overlay metacopy (ostree corruption workaround)
+        # overlayfs 的 metacopy 会导致 ostree 导入后文件内容与校验和对不上：
+        #   Corrupted file object; checksum expected=... actual=...
+        run: |
+          mkdir -p ~/.config/containers
+          cat > ~/.config/containers/storage.conf <<'EOF'
+          [storage]
+          driver = "overlay"
+
+          [storage.options.overlay]
+          mountopt = "nodev,metacopy=off"
+          EOF
+          podman info --format '{{.Store.GraphDriverName}}' || true
+
       - name: Patch pull policy
         working-directory: /work/src
         run: |
