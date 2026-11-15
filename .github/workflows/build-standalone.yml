@@ -140,11 +140,46 @@ jobs:
           PY
           grep -n "nullglob" "$f" | head -3
 
+      - name: Patch scx-scheds compiler (__u128 in Rust libbpf-sys)
+        working-directory: /work/src
+        run: |
+          f=packages/scx-scheds/build.sh
+          python3 - "$f" <<'PY'
+          import sys, pathlib
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text()
+          if "armada-u128" not in s:
+              inject = (
+                  "printf 'typedef signed __int128 __s128;\\ntypedef unsigned __int128 __u128;\\n' > /usr/local/include/armada-u128.h\n"
+                  "mkdir -p /usr/local/bin\n"
+                  "for c in gcc cc g++ c++ clang; do\n"
+                  "    if command -v \"$c\" >/dev/null 2>&1; then\n"
+                  "        real=$(command -v \"$c\")\n"
+                  "        case \"$real\" in /usr/local/bin/*) continue;; esac\n"
+                  "        printf '#!/bin/sh\\nexec %s -include /usr/local/include/armada-u128.h \"$@\"\\n' \"$real\" > \"/usr/local/bin/$c\"\n"
+                  "        chmod +x \"/usr/local/bin/$c\"\n"
+                  "    fi\n"
+                  "done\n"
+                  "export PATH=/usr/local/bin:$PATH\n"
+                  "export CFLAGS=\"-include /usr/local/include/armada-u128.h ${CFLAGS:-}\"\n"
+                  "export CXXFLAGS=\"-include /usr/local/include/armada-u128.h ${CXXFLAGS:-}\"\n"
+              )
+              s = s.replace("anda build --rpm-builder=rpmbuild", inject + "anda build --rpm-builder=rpmbuild", 1)
+              p.write_text(s)
+              print("patched scx-scheds build.sh")
+          else:
+              print("already patched")
+          PY
+          grep -n "armada-u128" "$f" | head -3
+
       - name: Build single package (quick check)
         if: inputs.only_package != ''
         working-directory: /work/src
         run: |
-          just package "${{ inputs.only_package }}"
+          for p in $(echo "${{ inputs.only_package }}" | tr ',' ' '); do
+            echo "==> building $p"
+            just package "$p"
+          done
 
       - name: Build all packages locally
         if: inputs.only_package == ''
