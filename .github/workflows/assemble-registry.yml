@@ -40,6 +40,16 @@ jobs:
           git rev-parse HEAD
           git submodule status | head -20
 
+      - name: Allow unprivileged user namespaces
+        # Ubuntu 24.04 默认 apparmor_restrict_unprivileged_userns=1，
+        # skopeo/podman rootless 的 unshare 会 EPERM，EDL 打包必挂。
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo "n/a"
+          echo "--- unshare test ---"
+          unshare --user --map-root-user true && echo "unshare OK" || echo "unshare FAILED"
+
       - name: Install just + loop devices
         run: |
           sudo modprobe loop max_loop=64 || true
