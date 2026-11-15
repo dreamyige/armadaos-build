@@ -1,0 +1,191 @@
+name: Build unsigned EDL package (standalone)
+
+# 独立仓库（非 fork）构建，绕开 GitHub 对公开 fork 的 Actions 禁用问题。
+# 源码在构建时从 codeload 下载，仓库里只放这一个工作流文件。
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "release = TB322FC+TB323FU；install = 全机型安装包"
+        type: choice
+        options: [release, install]
+        default: release
+      root_image_gib:
+        description: "root 镜像大小 (32 或 48 GiB)"
+        type: choice
+        options: ["32", "48"]
+        default: "32"
+      only_package:
+        description: "只构建单个包（快速验证，留空=全量）"
+        type: string
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+
+      - name: Download upstream source
+        run: |
+          set -eux
+          sudo mkdir -p /work/src
+          sudo chown "$(id -u):$(id -g)" /work/src
+          curl -fsSL --retry 3 -o /tmp/src.tgz \
+            https://codeload.github.com/ArmadaOS-Freedom/armadaos-freedom/tar.gz/refs/heads/main
+          tar -xzf /tmp/src.tgz -C /work/src --strip-components=1
+          ls /work/src | head -20
+
+      - name: Prepare loop devices
+        run: |
+          sudo modprobe loop max_loop=64 || true
+          sudo losetup -D || true
+          ls /dev/loop* | head
+          for d in /sys/block/loop*; do
+            [ -e "$d/loop/backing_file" ] || echo "free: $d"
+          done | head -5
+
+      - name: Enable x86_64 emulation (binfmt)
+        run: |
+          docker run --privileged --rm tonistiigi/binfmt --install amd64
+          ls /proc/sys/fs/binfmt_misc/ | head
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends uuid-runtime
+          if ! command -v just >/dev/null; then
+            URL=$(curl -fsSL https://api.github.com/repos/casey/just/releases/latest \
+                  | jq -r '.assets[] | select(.name|test("aarch64-unknown-linux-musl\\.tar\\.gz$")) | .browser_download_url' | head -1)
+            curl -fsSL "$URL" -o /tmp/just.tgz
+            sudo tar -xzf /tmp/just.tgz -C /usr/local/bin just
+          fi
+          just --version
+          docker info >/dev/null && echo "docker OK"
+          podman info >/dev/null && echo "podman OK" || echo "podman rootless failed"
+
+      - name: Patch kernel host tools (__u128)
+        working-directory: /work/src
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("packages/kernel/scripts/build-kernel.sh")
+          s = p.read_text()
+          marker = "# ---------- 2. Apply patches ----------"
+          inject = (
+              "# CI fix: define __u128 for host tools\n"
+              "printf 'typedef signed __int128 __s128;\\ntypedef unsigned __int128 __u128;\\n' > /tmp/armada-u128.h\n"
+              "find tools -name Makefile -print0 | while IFS= read -r -d '' mk; do\n"
+              "    printf '\\nCFLAGS += -include /tmp/armada-u128.h\\nHOSTCFLAGS += -include /tmp/armada-u128.h\\n' >> \"$mk\"\n"
+              "done\n"
+              "\n"
+          )
+          if "CI fix: define __u128" not in s:
+              assert marker in s, "marker not found"
+              s = s.replace(marker, inject + marker, 1)
+              p.write_text(s)
+              print("patched build-kernel.sh")
+          else:
+              print("already patched")
+          PY
+
+      - name: Patch mesa-x86 pacman sandbox (qemu)
+        working-directory: /work/src
+        run: |
+          f=packages/mesa-x86/build.sh
+          python3 - "$f" <<'PY'
+          import sys, pathlib
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text()
+          if "DisableSandbox" not in s:
+              inject = (
+                  "awk '{print} /^\\[options\\]/{print \"DisableSandbox\"}' /etc/pacman.conf > /tmp/pc.conf && mv /tmp/pc.conf /etc/pacman.conf\n"
+              )
+              s = s.replace("pacman -Syyuu", inject + "pacman -Syyuu", 1)
+              p.write_text(s)
+              print("patched mesa-x86 build.sh")
+          else:
+              print("already patched")
+          PY
+          grep -n "DisableSandbox" "$f" | head -3
+
+      - name: "Speed: skip mesa-x86 variants (CI time budget)"
+        working-directory: /work/src
+        run: |
+          f=packages/mesa-x86/build.sh
+          python3 - "$f" <<'PY'
+          import sys, pathlib
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text()
+          if "nullglob" not in s:
+              s = s.replace(
+                  "source /src/mesa/BASE.env",
+                  "source /src/mesa/BASE.env\n"
+                  "shopt -s nullglob\n"
+                  "mv /src/mesa/variants /src/mesa/variants.disabled 2>/dev/null || true",
+                  1,
+              )
+              p.write_text(s)
+              print("patched mesa-x86 variants skip")
+          else:
+              print("already patched")
+          PY
+          grep -n "nullglob" "$f" | head -3
+
+      - name: Build single package (quick check)
+        if: inputs.only_package != ''
+        working-directory: /work/src
+        run: |
+          just package "${{ inputs.only_package }}"
+
+      - name: Build all packages locally
+        if: inputs.only_package == ''
+        working-directory: /work/src
+        run: |
+          just packages
+
+      - name: Build arm64 image
+        if: inputs.only_package == ''
+        working-directory: /work/src
+        run: |
+          just build localhost/armada latest
+
+      - name: Show image info
+        if: inputs.only_package == ''
+        working-directory: /work/src
+        run: |
+          podman images
+          skopeo inspect containers-storage:localhost/armada:latest | head -40
+
+      - name: Build EDL package (unsigned)
+        if: inputs.only_package == ''
+        working-directory: /work/src
+        env:
+          EDL_PACKAGE_PROFILE: ${{ inputs.profile }}
+        run: |
+          just build-edl-package-local \
+            "ostree-image-signed:docker://ghcr.io/armadaos-freedom/armadaos-freedom:testing" \
+            localhost/armada latest
+
+      - name: List output
+        if: inputs.only_package == ''
+        working-directory: /work/src
+        run: |
+          find output/edl -type f -printf '%p  %s bytes\n' | head -50
+
+      - name: Upload package
+        if: inputs.only_package == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: edl-package-unsigned
+          path: /work/src/output/edl/**
+          if-no-files-found: error
+          compression-level: 0
