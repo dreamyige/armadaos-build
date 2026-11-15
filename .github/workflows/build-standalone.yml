@@ -181,11 +181,17 @@ jobs:
             just package "$p"
           done
 
-      - name: Build all packages locally
+      - name: Build all packages locally (parallel)
         if: inputs.only_package == ''
         working-directory: /work/src
         run: |
-          just packages
+          # 串行要 ~5h40m，加上镜像/打包会顶穿 6h 上限。
+          # 4 核 runner 用 2 路并行，预计压到 ~3h。
+          find packages -mindepth 2 -maxdepth 2 -name build.sh -printf '%h\n' \
+            | sed 's|^packages/||' | sort > /tmp/pkgs.txt
+          echo "packages: $(wc -l < /tmp/pkgs.txt)"
+          cat /tmp/pkgs.txt
+          xargs -a /tmp/pkgs.txt -P 2 -I{} just package {}
 
       - name: Build arm64 image
         if: inputs.only_package == ''
