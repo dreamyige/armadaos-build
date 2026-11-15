@@ -1,0 +1,268 @@
+name: Split build (packages A/B -> assemble)
+
+# 6 小时 job 上限的解法：包编译拆成两个并行 job（各 ~3h），
+# 各自 podman save 成 artifact；第三个 job 下载、load、构建镜像并打 EDL 包。
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "release = TB322FC+TB323FU"
+        type: choice
+        options: [release, install]
+        default: release
+      root_image_gib:
+        description: "root 镜像大小"
+        type: choice
+        options: ["32", "48"]
+        default: "32"
+
+env:
+  PKGS_A: "kernel lepton mesa-x86 kwin"
+  PKGS_B: "mesa mesa-android networkmanager scx-scheds gamescope powerdevil fex inputplumber jupiter-hw-support kshim-tools mangohud protontricks steam-bootstrap steamos-manager umtp-responder wpa_supplicant armada-rgb armada-splash btop-cn extest gamescope-session gamescope-session-steam"
+
+jobs:
+  packages-a:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 330
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+      - name: Download upstream source
+        run: |
+          set -eux
+          sudo mkdir -p /work/src
+          sudo chown "$(id -u):$(id -g)" /work/src
+          curl -fsSL --retry 3 -o /tmp/src.tgz \
+            https://codeload.github.com/ArmadaOS-Freedom/armadaos-freedom/tar.gz/refs/heads/main
+          tar -xzf /tmp/src.tgz -C /work/src --strip-components=1
+      - name: Enable x86_64 emulation
+        run: docker run --privileged --rm tonistiigi/binfmt --install amd64
+      - name: Install just
+        run: |
+          if ! command -v just >/dev/null; then
+            URL=$(curl -fsSL https://api.github.com/repos/casey/just/releases/latest \
+                  | jq -r '.assets[] | select(.name|test("aarch64-unknown-linux-musl\\.tar\\.gz$")) | .browser_download_url' | head -1)
+            curl -fsSL "$URL" -o /tmp/just.tgz
+            sudo tar -xzf /tmp/just.tgz -C /usr/local/bin just
+          fi
+          just --version
+      - name: Apply CI patches
+        working-directory: /work/src
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          # kernel: __u128 for host tools
+          p = Path("packages/kernel/scripts/build-kernel.sh")
+          s = p.read_text()
+          marker = "# ---------- 2. Apply patches ----------"
+          inject = (
+              "# CI fix: define __u128 for host tools\n"
+              "printf 'typedef signed __int128 __s128;\\ntypedef unsigned __int128 __u128;\\n' > /tmp/armada-u128.h\n"
+              "find tools -name Makefile -print0 | while IFS= read -r -d '' mk; do\n"
+              "    printf '\\nCFLAGS += -include /tmp/armada-u128.h\\nHOSTCFLAGS += -include /tmp/armada-u128.h\\n' >> \"$mk\"\n"
+              "done\n"
+              "\n"
+          )
+          if "CI fix: define __u128" not in s:
+              assert marker in s
+              p.write_text(s.replace(marker, inject + marker, 1))
+          # mesa-x86: pacman sandbox + skip variants
+          m = Path("packages/mesa-x86/build.sh")
+          t = m.read_text()
+          if "DisableSandbox" not in t:
+              inj = "awk '{print} /^\\[options\\]/{print \"DisableSandbox\"}' /etc/pacman.conf > /tmp/pc.conf && mv /tmp/pc.conf /etc/pacman.conf\n"
+              t = t.replace("pacman -Syyuu", inj + "pacman -Syyuu", 1)
+          if "nullglob" not in t:
+              t = t.replace(
+                  "source /src/mesa/BASE.env",
+                  "source /src/mesa/BASE.env\nshopt -s nullglob\nmv /src/mesa/variants /src/mesa/variants.disabled 2>/dev/null || true",
+                  1,
+              )
+          m.write_text(t)
+          print("patches applied")
+          PY
+      - name: Build packages A
+        working-directory: /work/src
+        run: |
+          set -eux
+          for p in $PKGS_A; do echo "==> $p"; just package "$p"; done
+      - name: Save images A
+        working-directory: /work/src
+        run: |
+          set -eux
+          : > /tmp/refs-a.txt
+          for p in $PKGS_A; do
+            h=$(bash packages/package-hash.sh "$p")
+            echo "localhost/armada/pkg/$p:$h" >> /tmp/refs-a.txt
+          done
+          cat /tmp/refs-a.txt
+          podman save -m -o /tmp/pkgs-a.tar $(cat /tmp/refs-a.txt)
+          ls -lh /tmp/pkgs-a.tar
+      - name: Upload images A
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkgs-a
+          path: /tmp/pkgs-a.tar
+          compression-level: 0
+
+  packages-b:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 330
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+      - name: Download upstream source
+        run: |
+          set -eux
+          sudo mkdir -p /work/src
+          sudo chown "$(id -u):$(id -g)" /work/src
+          curl -fsSL --retry 3 -o /tmp/src.tgz \
+            https://codeload.github.com/ArmadaOS-Freedom/armadaos-freedom/tar.gz/refs/heads/main
+          tar -xzf /tmp/src.tgz -C /work/src --strip-components=1
+      - name: Enable x86_64 emulation
+        run: docker run --privileged --rm tonistiigi/binfmt --install amd64
+      - name: Install just
+        run: |
+          if ! command -v just >/dev/null; then
+            URL=$(curl -fsSL https://api.github.com/repos/casey/just/releases/latest \
+                  | jq -r '.assets[] | select(.name|test("aarch64-unknown-linux-musl\\.tar\\.gz$")) | .browser_download_url' | head -1)
+            curl -fsSL "$URL" -o /tmp/just.tgz
+            sudo tar -xzf /tmp/just.tgz -C /usr/local/bin just
+          fi
+          just --version
+      - name: Apply CI patches
+        working-directory: /work/src
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          m = Path("packages/mesa-x86/build.sh")
+          t = m.read_text()
+          if "DisableSandbox" not in t:
+              inj = "awk '{print} /^\\[options\\]/{print \"DisableSandbox\"}' /etc/pacman.conf > /tmp/pc.conf && mv /tmp/pc.conf /etc/pacman.conf\n"
+              t = t.replace("pacman -Syyuu", inj + "pacman -Syyuu", 1)
+          if "nullglob" not in t:
+              t = t.replace(
+                  "source /src/mesa/BASE.env",
+                  "source /src/mesa/BASE.env\nshopt -s nullglob\nmv /src/mesa/variants /src/mesa/variants.disabled 2>/dev/null || true",
+                  1,
+              )
+          m.write_text(t)
+          s = Path("packages/scx-scheds/build.sh")
+          u = s.read_text()
+          if "armada-u128" not in u:
+              inj2 = (
+                  "printf 'typedef signed __int128 __s128;\\ntypedef unsigned __int128 __u128;\\n' > /usr/local/include/armada-u128.h\n"
+                  "mkdir -p /usr/local/bin\n"
+                  "for c in gcc cc g++ c++ clang; do\n"
+                  "    if command -v \"$c\" >/dev/null 2>&1; then\n"
+                  "        real=$(command -v \"$c\")\n"
+                  "        case \"$real\" in /usr/local/bin/*) continue;; esac\n"
+                  "        printf '#!/bin/sh\\nexec %s -include /usr/local/include/armada-u128.h \"$@\"\\n' \"$real\" > \"/usr/local/bin/$c\"\n"
+                  "        chmod +x \"/usr/local/bin/$c\"\n"
+                  "    fi\n"
+                  "done\n"
+                  "export PATH=/usr/local/bin:$PATH\n"
+                  "export CFLAGS=\"-include /usr/local/include/armada-u128.h ${CFLAGS:-}\"\n"
+                  "export CXXFLAGS=\"-include /usr/local/include/armada-u128.h ${CXXFLAGS:-}\"\n"
+              )
+              s.write_text(u.replace("anda build --rpm-builder=rpmbuild", inj2 + "anda build --rpm-builder=rpmbuild", 1))
+          print("patches applied")
+          PY
+      - name: Build packages B
+        working-directory: /work/src
+        run: |
+          set -eux
+          for p in $PKGS_B; do echo "==> $p"; just package "$p"; done
+      - name: Save images B
+        working-directory: /work/src
+        run: |
+          set -eux
+          : > /tmp/refs-b.txt
+          for p in $PKGS_B; do
+            h=$(bash packages/package-hash.sh "$p")
+            echo "localhost/armada/pkg/$p:$h" >> /tmp/refs-b.txt
+          done
+          cat /tmp/refs-b.txt
+          podman save -m -o /tmp/pkgs-b.tar $(cat /tmp/refs-b.txt)
+          ls -lh /tmp/pkgs-b.tar
+      - name: Upload images B
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkgs-b
+          path: /tmp/pkgs-b.tar
+          compression-level: 0
+
+  assemble:
+    needs: [packages-a, packages-b]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+      - name: Download upstream source
+        run: |
+          set -eux
+          sudo mkdir -p /work/src
+          sudo chown "$(id -u):$(id -g)" /work/src
+          curl -fsSL --retry 3 -o /tmp/src.tgz \
+            https://codeload.github.com/ArmadaOS-Freedom/armadaos-freedom/tar.gz/refs/heads/main
+          tar -xzf /tmp/src.tgz -C /work/src --strip-components=1
+      - name: Install just + loop devices
+        run: |
+          sudo modprobe loop max_loop=64 || true
+          sudo losetup -D || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends uuid-runtime
+          if ! command -v just >/dev/null; then
+            URL=$(curl -fsSL https://api.github.com/repos/casey/just/releases/latest \
+                  | jq -r '.assets[] | select(.name|test("aarch64-unknown-linux-musl\\.tar\\.gz$")) | .browser_download_url' | head -1)
+            curl -fsSL "$URL" -o /tmp/just.tgz
+            sudo tar -xzf /tmp/just.tgz -C /usr/local/bin just
+          fi
+          just --version
+          docker info >/dev/null && echo "docker OK"
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/artifacts
+          pattern: pkgs-*
+          merge-multiple: true
+      - name: Load package images
+        run: |
+          set -eux
+          ls -lh /tmp/artifacts
+          for f in /tmp/artifacts/*.tar; do podman load -i "$f"; done
+          podman images | grep armada/pkg | wc -l
+      - name: Build arm64 image
+        working-directory: /work/src
+        run: |
+          just build localhost/armada latest
+          podman images
+      - name: Build EDL package (unsigned)
+        working-directory: /work/src
+        env:
+          EDL_PACKAGE_PROFILE: ${{ inputs.profile }}
+        run: |
+          just build-edl-package-local \
+            "ostree-image-signed:docker://ghcr.io/armadaos-freedom/armadaos-freedom:testing" \
+            localhost/armada latest
+      - name: List output
+        working-directory: /work/src
+        run: find output/edl -type f -printf '%p  %s bytes\n' | head -50
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: edl-package-unsigned
+          path: /work/src/output/edl/**
+          if-no-files-found: error
+          compression-level: 0
