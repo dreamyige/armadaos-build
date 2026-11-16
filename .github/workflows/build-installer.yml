@@ -1,0 +1,70 @@
+name: Build patched Freedom installer (win-x64)
+
+# 从公开源码编译 ArmadaOS Freedom 安装器，补丁：跳过 update.json 签名校验
+# （我们的包是自建的未签名包）。离线更新组件为可选，不提供。
+#
+# 产物：FreedomInstaller.App.exe（Windows x64 自包含单文件）
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+
+      - name: Clone installer source
+        run: |
+          set -eux
+          git clone --depth 1 https://github.com/ArmadaOS-Freedom/armadaos-freedom-installer.git /work/installer
+          cd /work/installer
+          git rev-parse HEAD
+          ls
+
+      - name: Patch signature verification (skip)
+        working-directory: /work/installer
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("src/FreedomInstaller.Core/UpdateSignatureVerifier.cs")
+          s = p.read_text()
+          marker = "        return VerifyAndParseWithKey(document, signatureBase64, LoadTrustedPublicKeyPem());"
+          repl = "        return ParseDocument(document);  // CI_PATCH: signature verification disabled"
+          if "CI_PATCH" in s:
+              print("already patched")
+          else:
+              assert marker in s, "verifier marker not found"
+              p.write_text(s.replace(marker, repl, 1))
+              print("patched verifier")
+          PY
+          grep -n "CI_PATCH" src/FreedomInstaller.Core/UpdateSignatureVerifier.cs
+
+      - name: Build builder image
+        working-directory: /work/installer
+        run: |
+          docker build -f tools/installer-builder.Dockerfile -t armada-installer-builder tools
+
+      - name: Build installer (prepare + publish)
+        working-directory: /work/installer
+        run: |
+          mkdir -p artifacts
+          docker run --rm \
+            -v "$PWD:/src" -v "$PWD/artifacts:/work" \
+            armada-installer-builder \
+            python3 -B maintenance/build_installer.py \
+              --work-dir /work/build --output-dir /work/publish
+          ls -lh artifacts/publish
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: freedom-installer
+          path: /work/installer/artifacts/publish/**
+          if-no-files-found: error
+          compression-level: 6
