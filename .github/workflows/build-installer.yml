@@ -73,6 +73,37 @@ jobs:
           PY
           grep -n "ARMADA_CI_BACKUP_DIR" src/FreedomInstaller.App/MainWindow.InternalInstall.Backup.cs
 
+      - name: Patch known loader hashes (our device pair)
+        # 本机 ABL 是解锁补丁版（84b15de9…），xbl_config 也不同于作者测试机，
+        # 安装器因此走"未知 loader → 保守 128MiB"，装不下打包内核。
+        # 把我们设备的实际哈希写入已知清单，使其使用 256MiB 窗口算术。
+        working-directory: /work/installer
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("src/FreedomInstaller.Core/InternalSlotMaterialReader.cs")
+          s = p.read_text()
+          pairs = [
+              ("e7062378a1fe977df95341e5d3023dd510cffb283b11902a7cdbe74ba3e43885",
+               "84b15de9a9bdaa0df0a311e280061c835a469dcc7ca0f4335886a9974f786071"),
+              ("811489f0cefb662bccf91a89d2b50187cc1e8fb949486421fe19f820981ecae0",
+               "5e721263fb5505b9f127dac7616b74ceb70372d1b458e2cbb7a93234897191c5"),
+              ("88e56e47c12b68bca70b8943739bc3114ad6f9166ebc654945919bb1a158fbed",
+               "551c61638ed863b33321f71a4d43dac88cc4629fde197f94352fb9768106690c"),
+              ("1a937da630c966372a67ba60d0103997f61ce7d1df086b7b6c68e4fcc0ba73c3",
+               "e7e36297eb8836f8782ad2570c332e6fb0153ac3e0d2f20bead9f4739b9f9d85"),
+          ]
+          if "84b15de9" in s:
+              print("already patched")
+          else:
+              for old, new in pairs:
+                  assert old in s, "hash not found: " + old[:12]
+                  s = s.replace(old, new, 1)
+              p.write_text(s)
+              print("patched loader hashes")
+          PY
+          grep -n "84b15de9\|5e721263\|551c6163\|e7e36297" src/FreedomInstaller.Core/InternalSlotMaterialReader.cs
+
       - name: Build builder image
         working-directory: /work/installer
         run: |
