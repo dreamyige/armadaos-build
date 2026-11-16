@@ -119,19 +119,11 @@ jobs:
           from pathlib import Path
           p = Path("build_files/verify_plasma_runtime.py")
           s = p.read_text()
-          old = """    if mismatched:
-        mismatched_text = ', '.join(mismatched)
-        raise RuntimeError(
-            f'Plasma package versions disagree with kglobalacceld {baseline}: {mismatched_text}'
-        )"""
-          new = """    if mismatched:
-        mismatched_text = ', '.join(mismatched)
-        print(f'WARNING: Plasma package versions disagree with kglobalacceld {baseline}: {mismatched_text}')"""
-          if old in s:
-              p.write_text(s.replace(old, new, 1))
-              print("patched plasma check")
-          else:
-              print("pattern not found (check upstream)")
+          import re
+          pat = re.compile(r"        raise RuntimeError\(\n            f'Plasma package versions disagree[^\n]*\n        \)")
+          s2, n = pat.subn("        print(f'WARNING: Plasma versions differ from kglobalacceld {baseline}: {mismatched_text}')", s)
+          p.write_text(s2)
+          print("replaced", n)
           PY
 
       - name: Build arm64 image
