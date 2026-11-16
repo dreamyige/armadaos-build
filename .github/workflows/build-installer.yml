@@ -22,6 +22,8 @@ jobs:
       - name: Clone installer source
         run: |
           set -eux
+          sudo mkdir -p /work
+          sudo chown "$(id -u):$(id -g)" /work
           git clone --depth 1 https://github.com/ArmadaOS-Freedom/armadaos-freedom-installer.git /work/installer
           cd /work/installer
           git rev-parse HEAD
